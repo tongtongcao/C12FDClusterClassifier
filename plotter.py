@@ -3,8 +3,7 @@ import matplotlib
 matplotlib.use('Agg')
 from matplotlib import pyplot as plt
 import numpy as np
-from matplotlib.colors import LogNorm
-from scipy.stats import norm
+from sklearn.metrics import precision_score, recall_score, f1_score
 
 plt.rcParams.update({
     'font.size': 15,
