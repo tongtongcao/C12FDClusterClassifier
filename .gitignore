@@ -1,0 +1,10 @@
+clusters_sector1.csv
+clusters_sector1_small.csv
+__pycache__
+lightning_logs
+.idea
+target
+outputs
+checkpoints
+
+
