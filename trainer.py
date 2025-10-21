@@ -101,15 +101,18 @@ def build_graph_from_event(
         for j in range(i + 1, n):
             if connectable(evt.iloc[i], evt.iloc[j], avgWire_diff_max):
                 edges.append([i, j])
+
+                superlayer_diff = evt.iloc[i]["superlayer"] - evt.iloc[j]["superlayer"]
+                avgWire_diff = evt.iloc[i]["avgWire"] - evt.iloc[j]["avgWire"]
                 edge_attrs.append([
-                    float(evt.iloc[j]["superlayer"] - evt.iloc[i]["superlayer"] / 6.0),
-                    float((evt.iloc[j]["avgWire"] - evt.iloc[i]["avgWire"]) / wrange)
+                    float(superlayer_diff / 6.0),
+                    float(avgWire_diff / wrange)
                 ])
 
                 edges.append([j, i])
                 edge_attrs.append([
-                    float(evt.iloc[i]["superlayer"] - evt.iloc[j]["superlayer"] / 6.0),
-                    float((evt.iloc[i]["avgWire"] - evt.iloc[j]["avgWire"]) / wrange)
+                    float(-superlayer_diff / 6.0),
+                    float(-avgWire_diff / wrange)
                 ])
 
     if len(edges) == 0:
