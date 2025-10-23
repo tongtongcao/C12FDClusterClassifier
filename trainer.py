@@ -10,25 +10,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import Callback
 
 from torch_geometric.data import Data
-from torch_geometric.data import InMemoryDataset
 from torch_geometric.nn import SAGEConv
-
-
-# -----------------------------
-# connectable: ΔavgWire 阈值查表
-# -----------------------------
-def connectable(c1, c2, avgWire_diff_max: List[List[float]]):
-    L1, L2 = int(c1["superlayer"]), int(c2["superlayer"])
-    dL = abs(L2 - L1)
-    if dL == 0 or dL > len(avgWire_diff_max):
-        return False
-
-    lower = min(L1, L2)
-    thresholds = avgWire_diff_max[dL - 1]
-    if lower - 1 >= len(thresholds):
-        return False
-    max_diff = thresholds[lower - 1]
-    return abs(c1["avgWire"] - c2["avgWire"]) <= max_diff
 
 
 # -----------------------------
@@ -46,11 +28,10 @@ def parse_trkids_str(s):
 # -----------------------------
 # 构建单事件图
 # -----------------------------
-def build_graph_from_event(
-    evt: pd.DataFrame,
+def build_graph_from_hits_vectorized(
+    clusters: pd.DataFrame,
     num_tracks: int = 2,
-    avgWire_diff_max: List[List[float]] = None,
-    bidirectional: bool = True
+    avgWire_diff_max: list = None,
 ):
     if avgWire_diff_max is None:
         avgWire_diff_max = [
@@ -61,98 +42,84 @@ def build_graph_from_event(
             [56.0],
         ]
 
-    n = len(evt)
+    n = len(clusters)
     if n == 0:
         return None
 
-    avgWire = evt["avgWire"].values.astype(np.float32)
-    superlayer = evt["superlayer"].values.astype(np.int32)
+    # -----------------------------
+    # 节点特征
+    # -----------------------------
+    avgWire = clusters["avgWire"].values.astype(np.float32)
+    superlayer = clusters["superlayer"].values.astype(np.int32)
 
     wmin, wmax = float(avgWire.min()), float(avgWire.max())
     wrange = (wmax - wmin) if (wmax - wmin) > 1e-8 else 1.0
     avgWire_norm = (avgWire - wmin) / wrange
     superlayer_norm = superlayer / 6.0
 
-    trk_lists = [parse_trkids_str(t) for t in evt["trkIds"].values]
+    # 节点标签
+    trk_lists = [parse_trkids_str(t) for t in clusters["trkIds"].values]
     node_label = np.zeros((n, num_tracks), dtype=np.float32)
     for i, lst in enumerate(trk_lists):
         for t in lst:
             if 1 <= t <= num_tracks:
                 node_label[i, t - 1] = 1.0
 
-    degrees = np.zeros(n, dtype=np.float32)
-    for i in range(n):
-        deg = 0
-        for j in range(n):
-            if i == j:
+    # -----------------------------
+    # 度数计算向量化
+    # -----------------------------
+    L1 = superlayer[:, None]
+    L2 = superlayer[None, :]
+    dL = np.abs(L2 - L1)
+
+    W1 = avgWire[:, None]
+    W2 = avgWire[None, :]
+    diff = np.abs(W2 - W1)
+
+    mask = np.zeros((n, n), dtype=bool)
+    for delta in range(1, len(avgWire_diff_max)+1):
+        idx = np.where(dL == delta)
+        for i, j in zip(*idx):
+            lower = min(superlayer[i], superlayer[j])
+            if lower - 1 >= len(avgWire_diff_max[delta-1]):
                 continue
-            if connectable(evt.iloc[i], evt.iloc[j], avgWire_diff_max):
-                deg += 1
-        degrees[i] = deg
-    max_deg = degrees.max() if degrees.max() > 0 else 1.0
-    deg_norm = degrees / max_deg
+            max_diff = avgWire_diff_max[delta-1][lower-1]
+            if diff[i, j] <= max_diff:
+                mask[i, j] = True
+
+    degrees = mask.sum(axis=1).astype(np.float32)
+    deg_norm = degrees / max(1.0, degrees.max())
 
     x = np.stack([avgWire_norm, superlayer_norm, deg_norm], axis=1).astype(np.float32)
     x = torch.tensor(x, dtype=torch.float)
 
-    edges = []
-    edge_attrs = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            if connectable(evt.iloc[i], evt.iloc[j], avgWire_diff_max):
-                edges.append([i, j])
+    # -----------------------------
+    # 边生成向量化
+    # -----------------------------
+    src, dst = np.where(mask)
+    # 边特征
+    superlayer_diff = superlayer[src] - superlayer[dst]
+    avgWire_diff = avgWire[src] - avgWire[dst]
+    edge_attr = np.stack([superlayer_diff / 6.0, avgWire_diff / wrange], axis=1).astype(np.float32)
 
-                superlayer_diff = evt.iloc[i]["superlayer"] - evt.iloc[j]["superlayer"]
-                avgWire_diff = evt.iloc[i]["avgWire"] - evt.iloc[j]["avgWire"]
-                edge_attrs.append([
-                    float(superlayer_diff / 6.0),
-                    float(avgWire_diff / wrange)
-                ])
-
-                edges.append([j, i])
-                edge_attrs.append([
-                    float(-superlayer_diff / 6.0),
-                    float(-avgWire_diff / wrange)
-                ])
-
-    if len(edges) == 0:
+    if len(src) == 0:
         edge_index = torch.empty((2, 0), dtype=torch.long)
         edge_attr = torch.empty((0, 2), dtype=torch.float)
     else:
-        edge_index = torch.tensor(np.array(edges).T, dtype=torch.long)
-        edge_attr = torch.tensor(np.array(edge_attrs), dtype=torch.float)
+        edge_index = torch.tensor(np.stack([src, dst], axis=0), dtype=torch.long)
+        edge_attr = torch.tensor(edge_attr, dtype=torch.float)
 
+    # -----------------------------
+    # 构建 PyG Data 对象
+    # -----------------------------
     data = Data(
         x=x,
         edge_index=edge_index,
         edge_attr=edge_attr,
         y=torch.tensor(node_label, dtype=torch.float),
-        event_id=torch.tensor([int(evt["eventIdx"].iloc[0])], dtype=torch.long)
+        event_id=torch.tensor([int(clusters["eventIdx"].iloc[0])], dtype=torch.long)
     )
     return data
-
-
-# -----------------------------
-# InMemoryDataset
-# -----------------------------
-class EventGraphDataset(InMemoryDataset):
-    def __init__(self, df: pd.DataFrame, num_tracks: int = 2, avgWire_diff_max: List[List[float]] = None, transform=None):
-        super().__init__(None, transform)
-        self.num_tracks = num_tracks
-        self.avgWire_diff_max = avgWire_diff_max
-        self.data_list: List[Data] = []
-        for _, evt in df.groupby("eventIdx"):
-            evt = evt.reset_index(drop=True)
-            data = build_graph_from_event(evt, num_tracks=self.num_tracks, avgWire_diff_max=self.avgWire_diff_max)
-            if data is not None:
-                self.data_list.append(data)
-        self.data, self.slices = self.collate(self.data_list)
-
-    def len(self):
-        return len(self.data_list)
-
-    def get(self, idx):
-        return self.data_list[idx]
 
 
 # -----------------------------

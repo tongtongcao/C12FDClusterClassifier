@@ -1,9 +1,10 @@
 import argparse
 import os
 import time
+import random
 import torch
 import pytorch_lightning as pl
-from torch.utils.data import random_split
+from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
 from trainer import *
@@ -23,21 +24,20 @@ def parse_args():
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--no_train", action="store_true")
     parser.add_argument("--enable_progress_bar", action="store_true")
+    parser.add_argument("--val_ratio", type=float, default=0.2)
     return parser.parse_args()
 
-def load_dataset(csv_files, num_tracks=2):
-    df_list = []
-    offset = 0
-    for f in csv_files:
+def load_graphs_from_csv(files: List[str], val_ratio: float = 0.2):
+    all_graphs: List[Data] = []
+    for f in files:
         df = pd.read_csv(f)
-        df["eventIdx"] = df["eventIdx"] + offset
-        df_list.append(df)
-        offset += df["eventIdx"].max() + 1
-    df_all = pd.concat(df_list, ignore_index=True)
-    dataset = EventGraphDataset(df_all, num_tracks=num_tracks)
-    # 排除全噪声事件
-    dataset.data_list = [d for d in dataset.data_list if d.y.sum() > 0]
-    return dataset
+        for _, hits in df.groupby("eventIdx"):
+            data = build_graph_from_hits_vectorized(hits)
+            if data is not None:
+                all_graphs.append(data)
+    random.shuffle(all_graphs)
+    num_val = int(len(all_graphs) * val_ratio)
+    return all_graphs[num_val:], all_graphs[:num_val]
 
 def main():
     args = parse_args()
@@ -47,14 +47,10 @@ def main():
     # Load dataset
     print("Loading dataset...")
     start_time = time.time()
-    dataset = load_dataset(args.inputs, num_tracks=2)
-    dataset_size = len(dataset)
-    val_size = max(1, int(0.2 * dataset_size))
-    train_size = dataset_size - val_size
-    train_set, val_set = random_split(dataset, [train_size, val_size])
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, persistent_workers=True)
-    val_loader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=0, persistent_workers=False)
-    print(f"Train size: {train_size}, Val size: {val_size}")
+    train_graphs, val_graphs = load_graphs_from_csv(args.inputs, val_ratio=args.val_ratio)
+    train_loader = DataLoader(train_graphs, batch_size=args.batch_size, shuffle=True, num_workers=4, persistent_workers=True)
+    val_loader = DataLoader(val_graphs, batch_size=1, shuffle=False, num_workers=0, persistent_workers=False)
+    print(f"Train size: {len(train_graphs)}, Val size: {len(val_graphs)}")
     print(f"Data loading took {time.time() - start_time:.2f}s")
 
     # -------------------------
